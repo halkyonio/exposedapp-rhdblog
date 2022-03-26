@@ -1,0 +1,12 @@
+domain: halkyon.io
+layout:
+- quarkus.javaoperatorsdk.io/v1-alpha
+projectName: expose
+resources:
+- api:
+    crdVersion: v1
+    namespaced: true
+  domain: halkyon.io
+  kind: ExposedApp
+  version: v1alpha1
+version: "3"
