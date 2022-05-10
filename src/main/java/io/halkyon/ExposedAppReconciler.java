@@ -1,9 +1,11 @@
 package io.halkyon;
 
+import io.fabric8.kubernetes.api.model.LoadBalancerIngress;
 import io.fabric8.kubernetes.api.model.ObjectMeta;
 import io.fabric8.kubernetes.api.model.ObjectMetaBuilder;
 import io.fabric8.kubernetes.api.model.ServiceBuilder;
 import io.fabric8.kubernetes.api.model.apps.DeploymentBuilder;
+import io.fabric8.kubernetes.api.model.networking.v1.Ingress;
 import io.fabric8.kubernetes.api.model.networking.v1.IngressBuilder;
 import io.fabric8.kubernetes.client.KubernetesClient;
 import io.javaoperatorsdk.operator.api.reconciler.Constants;
@@ -12,6 +14,7 @@ import io.javaoperatorsdk.operator.api.reconciler.ControllerConfiguration;
 import io.javaoperatorsdk.operator.api.reconciler.Reconciler;
 import io.javaoperatorsdk.operator.api.reconciler.UpdateControl;
 import java.util.Map;
+import java.util.Optional;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -21,6 +24,8 @@ public class ExposedAppReconciler implements Reconciler<ExposedApp> {
   static final Logger log = LoggerFactory.getLogger(ExposedAppReconciler.class);
   static final String APP_LABEL = "app.kubernetes.io/name";
   private final KubernetesClient client;
+  
+  private static final ExposedAppStatus DEFAULT_STATUS = new ExposedAppStatus("processing", null);
 
   public ExposedAppReconciler(KubernetesClient client) {
     this.client = client;
@@ -72,7 +77,7 @@ public class ExposedAppReconciler implements Reconciler<ExposedApp> {
         "nginx.ingress.kubernetes.io/rewrite-target", "/",
         "kubernetes.io/ingress.class", "nginx"
     ));
-    client.network().v1().ingresses().createOrReplace(new IngressBuilder()
+    final var ingress = client.network().v1().ingresses().createOrReplace(new IngressBuilder()
         .withMetadata(metadata)
         .withNewSpec()
           .addNewRule()
@@ -91,10 +96,26 @@ public class ExposedAppReconciler implements Reconciler<ExposedApp> {
           .endRule()
         .endSpec()
         .build());
-    
-    return UpdateControl.noUpdate();
-  }
 
+    // add status to resource
+    final var maybeStatus = ingress.getStatus();
+    final var status = Optional.ofNullable(maybeStatus).map(s -> {
+      var result = DEFAULT_STATUS;
+      final var ingresses = s.getLoadBalancer().getIngress();
+      if (ingresses != null && !ingresses.isEmpty()) {
+        // only set the status if the ingress is ready to provide the info we need
+        LoadBalancerIngress ing = ingresses.get(0);
+        String hostname = ing.getHostname();
+        final var url = "https://" + (hostname != null ? hostname : ing.getIp());
+        log.info("App {} is exposed and ready to used at {}", name, url);
+        result = new ExposedAppStatus("exposed", url);
+      }
+      return result;
+    }).orElse(DEFAULT_STATUS);
+
+    exposedApp.setStatus(status);
+    return UpdateControl.updateStatus(exposedApp);
+  }
   private ObjectMeta createMetadata(ExposedApp resource, Map<String, String> labels) {
     final var metadata = resource.getMetadata();
     return new ObjectMetaBuilder()
