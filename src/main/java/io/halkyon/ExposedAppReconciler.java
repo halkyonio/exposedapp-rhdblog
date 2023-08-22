@@ -60,7 +60,7 @@ public class ExposedAppReconciler implements Reconciler<ExposedApp> {
           .addNewPort()
             .withName("http")
             .withPort(8080)
-            .withNewTargetPort().withIntVal(8080).endTargetPort()
+            .withNewTargetPort(8080)
           .endPort()
           .withSelector(labels)
           .withType("ClusterIP")
