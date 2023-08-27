@@ -10,11 +10,13 @@ import io.fabric8.kubernetes.client.KubernetesClient;
 import io.fabric8.kubernetes.client.Watcher;
 import io.fabric8.kubernetes.client.WatcherException;
 import io.javaoperatorsdk.operator.OperatorException;
+import io.javaoperatorsdk.operator.api.config.informer.InformerConfiguration;
 import io.javaoperatorsdk.operator.api.reconciler.*;
 import io.javaoperatorsdk.operator.processing.event.Event;
 import io.javaoperatorsdk.operator.processing.event.EventHandler;
 import io.javaoperatorsdk.operator.processing.event.ResourceID;
 import io.javaoperatorsdk.operator.processing.event.source.EventSource;
+import io.javaoperatorsdk.operator.processing.event.source.informer.InformerEventSource;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -136,47 +138,7 @@ public class ExposedAppReconciler implements Reconciler<ExposedApp>, EventSource
 
     @Override
     public Map<String, EventSource> prepareEventSources(EventSourceContext<ExposedApp> eventSourceContext) {
-        return Map.of("ingress-event-source", IngressEventSource.create(eventSourceContext.getClient()));
-    }
-
-    public static class IngressEventSource implements EventSource, Watcher<Ingress> {
-        private EventHandler handler;
-
-        public static IngressEventSource create(KubernetesClient client) {
-            final var eventSource = new IngressEventSource();
-            client.network().v1().ingresses().watch(eventSource);
-            return eventSource;
-        }
-
-        @Override
-        public void eventReceived(Action action, Ingress ingress) {
-            final var status = ingress.getStatus();
-            if (status != null) {
-                final var ingressStatus = status.getLoadBalancer().getIngress();
-                if (!ingressStatus.isEmpty()) {
-                    ResourceID.fromFirstOwnerReference(ingress).ifPresent(resourceID -> handler.handleEvent(new Event(resourceID)));
-                }
-            }
-        }
-
-        @Override
-        public void onClose(WatcherException e) {
-        }
-
-        @Override
-        public void setEventHandler(EventHandler eventHandler) {
-            this.handler = eventHandler;
-        }
-
-        @Override
-        public void start() throws OperatorException {
-
-        }
-
-        @Override
-        public void stop() throws OperatorException {
-
-        }
+        return EventSourceInitializer.nameEventSources(new InformerEventSource<>(InformerConfiguration.from(Ingress.class).build(), eventSourceContext));  
     }
 }
 
