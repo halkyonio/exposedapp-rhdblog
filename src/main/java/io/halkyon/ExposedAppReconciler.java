@@ -4,37 +4,45 @@ import io.fabric8.kubernetes.api.model.ObjectMeta;
 import io.fabric8.kubernetes.api.model.ObjectMetaBuilder;
 import io.fabric8.kubernetes.api.model.ServiceBuilder;
 import io.fabric8.kubernetes.api.model.apps.DeploymentBuilder;
+import io.fabric8.kubernetes.api.model.networking.v1.Ingress;
 import io.fabric8.kubernetes.api.model.networking.v1.IngressBuilder;
 import io.fabric8.kubernetes.client.KubernetesClient;
-import io.javaoperatorsdk.operator.api.reconciler.Constants;
-import io.javaoperatorsdk.operator.api.reconciler.Context;
-import io.javaoperatorsdk.operator.api.reconciler.ControllerConfiguration;
-import io.javaoperatorsdk.operator.api.reconciler.Reconciler;
-import io.javaoperatorsdk.operator.api.reconciler.UpdateControl;
-import java.util.Map;
+import io.fabric8.kubernetes.client.Watcher;
+import io.fabric8.kubernetes.client.WatcherException;
+import io.javaoperatorsdk.operator.OperatorException;
+import io.javaoperatorsdk.operator.api.reconciler.*;
+import io.javaoperatorsdk.operator.processing.event.Event;
+import io.javaoperatorsdk.operator.processing.event.EventHandler;
+import io.javaoperatorsdk.operator.processing.event.ResourceID;
+import io.javaoperatorsdk.operator.processing.event.source.EventSource;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
+import java.util.Map;
+import java.util.Optional;
+
 @ControllerConfiguration(name = "exposedapp", namespaces = Constants.WATCH_CURRENT_NAMESPACE)
-public class ExposedAppReconciler implements Reconciler<ExposedApp> {
+public class ExposedAppReconciler implements Reconciler<ExposedApp>, EventSourceInitializer<ExposedApp> {
 
-  static final Logger log = LoggerFactory.getLogger(ExposedAppReconciler.class);
-  static final String APP_LABEL = "app.kubernetes.io/name";
-  private final KubernetesClient client;
+    static final Logger log = LoggerFactory.getLogger(ExposedAppReconciler.class);
+    static final String APP_LABEL = "app.kubernetes.io/name";
+    private final KubernetesClient client;
 
-  public ExposedAppReconciler(KubernetesClient client) {
-    this.client = client;
-  }
+    private static final ExposedAppStatus DEFAULT_STATUS = new ExposedAppStatus("processing", null);
 
-  @Override
-  public UpdateControl<ExposedApp> reconcile(ExposedApp exposedApp, Context context) {
-    final var labels = Map.of(APP_LABEL, exposedApp.getMetadata().getName());
-    final var name = exposedApp.getMetadata().getName();
-    final var spec = exposedApp.getSpec();
-    final var imageRef = spec.getImageRef();
-    final var metadata = createMetadata(exposedApp, labels);
+    public ExposedAppReconciler(KubernetesClient client) {
+        this.client = client;
+    }
 
-    // @formatter:off
+    @Override
+    public UpdateControl<ExposedApp> reconcile(ExposedApp exposedApp, Context context) {
+        final var labels = Map.of(APP_LABEL, exposedApp.getMetadata().getName());
+        final var name = exposedApp.getMetadata().getName();
+        final var spec = exposedApp.getSpec();
+        final var imageRef = spec.getImageRef();
+        final var metadata = createMetadata(exposedApp, labels);
+
+        // @formatter:off
     log.info("Create deployment {}", metadata.getName());
     final var deployment = new DeploymentBuilder()
         .withMetadata(createMetadata(exposedApp, labels))
@@ -72,7 +80,7 @@ public class ExposedAppReconciler implements Reconciler<ExposedApp> {
         "nginx.ingress.kubernetes.io/rewrite-target", "/",
         "kubernetes.io/ingress.class", "nginx"
     ));
-    client.network().v1().ingresses().createOrReplace(new IngressBuilder()
+    final var ingress = client.network().v1().ingresses().createOrReplace(new IngressBuilder()
         .withMetadata(metadata)
         .withNewSpec()
           .addNewRule()
@@ -91,22 +99,84 @@ public class ExposedAppReconciler implements Reconciler<ExposedApp> {
           .endRule()
         .endSpec()
         .build());
-    
-    return UpdateControl.noUpdate();
-  }
+    // @formatter:on
 
-  private ObjectMeta createMetadata(ExposedApp resource, Map<String, String> labels) {
-    final var metadata = resource.getMetadata();
-    return new ObjectMetaBuilder()
-        .withName(metadata.getName())
-        .addNewOwnerReference()
-          .withUid(metadata.getUid())
-          .withApiVersion(resource.getApiVersion())
-          .withName(metadata.getName())
-          .withKind(resource.getKind())
-        .endOwnerReference()
-        .withLabels(labels)
-        .build();
-  }
+        final var maybeStatus = ingress.getStatus();
+        final var status = Optional.ofNullable(maybeStatus).map(s -> {
+            var result = DEFAULT_STATUS;
+            final var ingresses = s.getLoadBalancer().getIngress();
+            if (ingresses != null && !ingresses.isEmpty()) {
+                // only set the status if the ingress is ready to provide the info we need
+                var ing = ingresses.get(0);
+                String hostname = ing.getHostname();
+                final var url = "https://" + (hostname != null ? hostname : ing.getIp());
+                log.info("App {} is exposed and ready to used at {}", name, url);
+                result = new ExposedAppStatus("exposed", url);
+            }
+            return result;
+        }).orElse(DEFAULT_STATUS);
+
+        exposedApp.setStatus(status);
+        return UpdateControl.updateStatus(exposedApp);
+    }
+
+    private ObjectMeta createMetadata(ExposedApp resource, Map<String, String> labels) {
+        final var metadata = resource.getMetadata();
+        return new ObjectMetaBuilder()
+                .withName(metadata.getName())
+                .addNewOwnerReference()
+                .withUid(metadata.getUid())
+                .withApiVersion(resource.getApiVersion())
+                .withName(metadata.getName())
+                .withKind(resource.getKind())
+                .endOwnerReference()
+                .withLabels(labels)
+                .build();
+    }
+
+    @Override
+    public Map<String, EventSource> prepareEventSources(EventSourceContext<ExposedApp> eventSourceContext) {
+        return Map.of("ingress-event-source", IngressEventSource.create(eventSourceContext.getClient()));
+    }
+
+    public static class IngressEventSource implements EventSource, Watcher<Ingress> {
+        private EventHandler handler;
+
+        public static IngressEventSource create(KubernetesClient client) {
+            final var eventSource = new IngressEventSource();
+            client.network().v1().ingresses().watch(eventSource);
+            return eventSource;
+        }
+
+        @Override
+        public void eventReceived(Action action, Ingress ingress) {
+            final var status = ingress.getStatus();
+            if (status != null) {
+                final var ingressStatus = status.getLoadBalancer().getIngress();
+                if (!ingressStatus.isEmpty()) {
+                    ResourceID.fromFirstOwnerReference(ingress).ifPresent(resourceID -> handler.handleEvent(new Event(resourceID)));
+                }
+            }
+        }
+
+        @Override
+        public void onClose(WatcherException e) {
+        }
+
+        @Override
+        public void setEventHandler(EventHandler eventHandler) {
+            this.handler = eventHandler;
+        }
+
+        @Override
+        public void start() throws OperatorException {
+
+        }
+
+        @Override
+        public void stop() throws OperatorException {
+
+        }
+    }
 }
 
