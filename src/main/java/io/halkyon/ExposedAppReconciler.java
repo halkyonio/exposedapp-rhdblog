@@ -1,5 +1,6 @@
 package io.halkyon;
 
+import io.fabric8.kubernetes.api.model.ListOptionsBuilder;
 import io.fabric8.kubernetes.api.model.ObjectMeta;
 import io.fabric8.kubernetes.api.model.ObjectMetaBuilder;
 import io.fabric8.kubernetes.api.model.ServiceBuilder;
@@ -22,6 +23,9 @@ public class ExposedAppReconciler implements Reconciler<ExposedApp>, EventSource
 
     static final Logger log = LoggerFactory.getLogger(ExposedAppReconciler.class);
     static final String APP_LABEL = "app.kubernetes.io/name";
+    static final String MANAGED_BY_KEY = "app.kubernetes.io/managed-by";
+    static final String MANAGED_BY_VALUE = "exposedapp-controller";
+    static final String MANAGED_BY_SELECTOR = MANAGED_BY_KEY + "=" + MANAGED_BY_VALUE;
     private final KubernetesClient client;
 
     private static final ExposedAppStatus DEFAULT_STATUS = new ExposedAppStatus("processing", null);
@@ -32,7 +36,10 @@ public class ExposedAppReconciler implements Reconciler<ExposedApp>, EventSource
 
     @Override
     public UpdateControl<ExposedApp> reconcile(ExposedApp exposedApp, Context context) {
-        final var labels = Map.of(APP_LABEL, exposedApp.getMetadata().getName());
+        final var labels = Map.of(
+                APP_LABEL, exposedApp.getMetadata().getName(),
+                MANAGED_BY_KEY, MANAGED_BY_VALUE
+        );
         final var name = exposedApp.getMetadata().getName();
         final var spec = exposedApp.getSpec();
         final var imageRef = spec.getImageRef();
@@ -41,7 +48,7 @@ public class ExposedAppReconciler implements Reconciler<ExposedApp>, EventSource
         // @formatter:off
     log.info("Create deployment {}", metadata.getName());
     final var deployment = new DeploymentBuilder()
-        .withMetadata(createMetadata(exposedApp, labels))
+        .withMetadata(metadata)
         .withNewSpec()
           .withNewSelector().withMatchLabels(labels).endSelector()
           .withNewTemplate()
@@ -59,7 +66,7 @@ public class ExposedAppReconciler implements Reconciler<ExposedApp>, EventSource
 
     log.info("Create service {}", metadata.getName());
     client.services().createOrReplace(new ServiceBuilder()
-        .withMetadata(createMetadata(exposedApp,labels))
+        .withMetadata(metadata)
         .withNewSpec()
           .addNewPort()
             .withName("http")
@@ -132,7 +139,8 @@ public class ExposedAppReconciler implements Reconciler<ExposedApp>, EventSource
 
     @Override
     public Map<String, EventSource> prepareEventSources(EventSourceContext<ExposedApp> eventSourceContext) {
-        return EventSourceInitializer.nameEventSources(new InformerEventSource<>(InformerConfiguration.from(Ingress.class).build(), eventSourceContext));  
+        final var config = InformerConfiguration.from(Ingress.class).withLabelSelector(MANAGED_BY_SELECTOR).build();
+        return EventSourceInitializer.nameEventSources(new InformerEventSource<>(config, eventSourceContext));
     }
 }
 
